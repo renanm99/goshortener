@@ -1,0 +1,370 @@
+name: Deploy to Production (Local Minikube)
+
+# 🚨 DEPLOY APENAS MANUAL - SEM TRIGGER AUTOMÁTICO
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy'
+        required: true
+        default: 'main'
+        type: choice
+        options:
+        - main
+        - hotfix/emergency
+      environment:
+        description: 'Confirm environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+        - production
+      run_tests:
+        description: 'Run tests before deploy'
+        required: false
+        default: true
+        type: boolean
+      force_deploy:
+        description: 'Force deployment even if tests fail'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: localhost:5000
+  IMAGE_NAME: goshortener
+  MINIKUBE_PROFILE: prd
+  NAMESPACE: goshortener-prd
+
+jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      
+      - name: Run tests
+        run: |
+          go mod download
+          go test -v -cover -race ./...
+          go test -coverprofile=coverage.out ./...
+          go tool cover -html=coverage.out -o coverage.html
+      
+      - name: Upload coverage
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage.html
+
+  build-and-deploy:
+    needs: test
+    runs-on: self-hosted
+    if: ${{ success() || github.event.inputs.force_deploy == 'true' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Minikube Environment
+        run: |
+          # Verificar se minikube está rodando
+          if ! minikube status --profile=${{ env.MINIKUBE_PROFILE }} >/dev/null 2>&1; then
+            echo "❌ Minikube não está rodando! Execute o setup primeiro."
+            echo "Execute: ./scripts/setup-production-minikube.sh"
+            exit 1
+          fi
+          
+          # Configurar docker para usar registry do minikube
+          eval $(minikube docker-env --profile=${{ env.MINIKUBE_PROFILE }})
+          
+          # Configurar kubectl context
+          kubectl config use-context ${{ env.MINIKUBE_PROFILE }}
+          
+          echo "✅ Minikube configurado para profile: ${{ env.MINIKUBE_PROFILE }}"
+          echo "🔧 Context atual: $(kubectl config current-context)"
+      
+      - name: Build Docker Image
+        run: |
+          eval $(minikube docker-env --profile=${{ env.MINIKUBE_PROFILE }})
+          
+          # Build da imagem com múltiplas tags
+          docker build \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg VERSION=${{ github.ref_name }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ env.IMAGE_NAME }}:$(date +%Y%m%d-%H%M%S) .
+          
+          echo "✅ Imagem construída com sucesso!"
+          docker images | grep ${{ env.IMAGE_NAME }}
+      
+      - name: Create Kubernetes Manifests
+        run: |
+          mkdir -p k8s/production
+          
+          # Deployment
+          cat > k8s/production/deployment.yaml <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: goshortener
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: goshortener
+              version: v1
+          spec:
+            replicas: 3
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0
+            selector:
+              matchLabels:
+                app: goshortener
+            template:
+              metadata:
+                labels:
+                  app: goshortener
+                  version: v1
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "8080"
+                  prometheus.io/path: "/metrics"
+              spec:
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 1000
+                  fsGroup: 2000
+                containers:
+                - name: goshortener
+                  image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+                  imagePullPolicy: IfNotPresent
+                  ports:
+                  - containerPort: 8080
+                    name: http
+                    protocol: TCP
+                  env:
+                  - name: PORT
+                    value: "8080"
+                  - name: ENVIRONMENT
+                    value: "production"
+                  - name: LOG_LEVEL
+                    value: "info"
+                  resources:
+                    requests:
+                      memory: "256Mi"
+                      cpu: "250m"
+                    limits:
+                      memory: "512Mi"
+                      cpu: "500m"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  readinessProbe:
+                    httpGet:
+                      path: /ready
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                    failureThreshold: 3
+                  securityContext:
+                    allowPrivilegeEscalation: false
+                    capabilities:
+                      drop:
+                      - ALL
+                    readOnlyRootFilesystem: true
+                  volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+                volumes:
+                - name: tmp
+                  emptyDir: {}
+          EOF
+          
+          # Service
+          cat > k8s/production/service.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: goshortener
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: goshortener
+          spec:
+            selector:
+              app: goshortener
+            ports:
+            - port: 80
+              targetPort: 8080
+              protocol: TCP
+              name: http
+            type: ClusterIP
+          EOF
+          
+          # Ingress
+          cat > k8s/production/ingress.yaml <<EOF
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: goshortener
+            namespace: ${{ env.NAMESPACE }}
+            annotations:
+              nginx.ingress.kubernetes.io/rewrite-target: /
+              nginx.ingress.kubernetes.io/ssl-redirect: "false"
+          spec:
+            ingressClassName: nginx
+            rules:
+            - http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: goshortener
+                      port:
+                        number: 80
+          EOF
+      
+      - name: Deploy to Kubernetes
+        run: |
+          # Usar contexto do minikube
+          kubectl config use-context ${{ env.MINIKUBE_PROFILE }}
+          
+          # Verificar se namespace existe
+          kubectl get namespace ${{ env.NAMESPACE }} || kubectl create namespace ${{ env.NAMESPACE }}
+          
+          # Deploy usando manifests
+          kubectl apply -f k8s/production/deployment.yaml
+          kubectl apply -f k8s/production/service.yaml
+          kubectl apply -f k8s/production/ingress.yaml
+          
+          # Aguardar rollout
+          kubectl rollout status deployment/goshortener -n ${{ env.NAMESPACE }} --timeout=300s
+          
+          echo "✅ Deploy realizado com sucesso!"
+      
+      - name: Health Check
+        run: |
+          # Aguardar pods estarem prontos
+          kubectl wait --for=condition=ready pod -l app=goshortener -n ${{ env.NAMESPACE }} --timeout=120s
+          
+          # Obter URL do ingress
+          INGRESS_IP=$(minikube ip --profile=${{ env.MINIKUBE_PROFILE }})
+          
+          echo "🔗 Testing application at: http://$INGRESS_IP"
+          
+          # Teste de saúde com retry
+          for i in {1..10}; do
+            if curl -f --connect-timeout 10 http://$INGRESS_IP/health 2>/dev/null; then
+              echo "✅ Health check passou na tentativa $i!"
+              break
+            else
+              echo "⏳ Tentativa $i/10 falhou, aguardando 10s..."
+              sleep 10
+            fi
+            
+            if [ $i -eq 10 ]; then
+              echo "❌ Health check falhou após 10 tentativas"
+              kubectl get pods -n ${{ env.NAMESPACE }}
+              kubectl logs -l app=goshortener -n ${{ env.NAMESPACE }} --tail=20
+              exit 1
+            fi
+          done
+          
+          # Mostrar status dos recursos
+          echo "📊 Status dos recursos:"
+          kubectl get pods,svc,ingress -n ${{ env.NAMESPACE }}
+      
+      - name: Run Smoke Tests
+        run: |
+          INGRESS_IP=$(minikube ip --profile=${{ env.MINIKUBE_PROFILE }})
+          
+          echo "🧪 Executando testes de fumaça..."
+          
+          # Teste básico de encurtamento
+          response=$(curl -s -X POST http://$INGRESS_IP/shorten \
+            -H "Content-Type: application/json" \
+            -d '{"url":"https://github.com/renanm99/goshortener"}' || echo "ERROR")
+          
+          if echo "$response" | grep -q "short_id"; then
+            echo "✅ Teste de encurtamento passou!"
+            short_id=$(echo "$response" | grep -o '"short_id":"[^"]*"' | cut -d'"' -f4)
+            echo "🔗 Short ID gerado: $short_id"
+            
+            # Teste de redirecionamento
+            redirect_response=$(curl -s -I http://$INGRESS_IP/$short_id || echo "ERROR")
+            if echo "$redirect_response" | grep -q "301\|302"; then
+              echo "✅ Teste de redirecionamento passou!"
+            else
+              echo "⚠️ Teste de redirecionamento pode ter falhado"
+              echo "$redirect_response"
+            fi
+          else
+            echo "❌ Teste de encurtamento falhou!"
+            echo "Response: $response"
+            exit 1
+          fi
+      
+      - name: Performance Test
+        run: |
+          INGRESS_IP=$(minikube ip --profile=${{ env.MINIKUBE_PROFILE }})
+          
+          echo "⚡ Executando teste básico de performance..."
+          
+          # Teste de carga simples com curl
+          for i in {1..5}; do
+            start_time=$(date +%s%N)
+            curl -s -f http://$INGRESS_IP/health >/dev/null
+            end_time=$(date +%s%N)
+            response_time=$(((end_time - start_time) / 1000000))
+            echo "Request $i: ${response_time}ms"
+          done
+      
+      - name: Notify Deployment Status
+        if: always()
+        run: |
+          INGRESS_IP=$(minikube ip --profile=${{ env.MINIKUBE_PROFILE }})
+          
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "🎉 Deploy para produção realizado com sucesso!"
+            echo "🔗 Acesse a aplicação: http://$INGRESS_IP"
+            echo "📊 Dashboard: minikube dashboard --profile=${{ env.MINIKUBE_PROFILE }}"
+            echo "📈 Monitoramento: ./scripts/monitor-production.sh"
+          else
+            echo "❌ Deploy falhou! Verificar logs acima."
+            echo "🔍 Debug: kubectl logs -l app=goshortener -n ${{ env.NAMESPACE }}"
+            echo "📊 Status: kubectl get pods -n ${{ env.NAMESPACE }}"
+          fi
+      
+      - name: Cleanup Old Images
+        if: always()
+        run: |
+          eval $(minikube docker-env --profile=${{ env.MINIKUBE_PROFILE }})
+          
+          # Manter apenas as 5 imagens mais recentes
+          docker images ${{ env.IMAGE_NAME }} --format "table {{.Repository}}:{{.Tag}}\t{{.CreatedAt}}" | \
+            grep -v "latest" | tail -n +6 | awk '{print $1}' | \
+            xargs -r docker rmi || true
+          
+          echo "🧹 Limpeza de imagens antigas concluída"

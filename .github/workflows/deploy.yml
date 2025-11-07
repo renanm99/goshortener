@@ -1,6 +1,19 @@
 name: Deploy Application
 
 on:
+  # Push automático para HML (qualquer branch exceto main)
+  push:
+    branches:
+      - develop
+      - 'feature/**'
+      - 'hotfix/**'
+      - 'bugfix/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+  
+  # Deploy manual (permite escolher ambiente e branch)
   workflow_dispatch:
     inputs:
       environment:
@@ -21,7 +34,7 @@ on:
         type: boolean
         default: true
       force_deploy:
-        description: 'Force deployment (skip test failures - PRD only)'
+        description: 'Force deployment (skip test failures - HML only)'
         required: false
         type: boolean
         default: false
@@ -43,19 +56,45 @@ jobs:
       memory_limit: ${{ steps.set-env.outputs.memory_limit }}
       cpu_request: ${{ steps.set-env.outputs.cpu_request }}
       cpu_limit: ${{ steps.set-env.outputs.cpu_limit }}
+      environment: ${{ steps.set-env.outputs.environment }}
+      deploy_branch: ${{ steps.set-env.outputs.deploy_branch }}
+      run_tests: ${{ steps.set-env.outputs.run_tests }}
     
     steps:
       - name: Validate and Set Environment Variables
         id: set-env
         run: |
-          echo "🔧 Configurando variáveis para: ${{ github.event.inputs.environment }}"
+          # Detectar se é push automático ou manual
+          if [ "${{ github.event_name }}" == "push" ]; then
+            # Push automático: sempre HML
+            ENVIRONMENT="homologation"
+            BRANCH="${{ github.ref_name }}"
+            RUN_TESTS="true"
+            
+            echo "🤖 Deploy AUTOMÁTICO via push"
+            echo "📍 Branch: $BRANCH"
+          else
+            # Manual: usar inputs
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            BRANCH="${{ github.event.inputs.branch }}"
+            RUN_TESTS="${{ github.event.inputs.run_tests }}"
+            
+            echo "👤 Deploy MANUAL"
+            echo "📍 Branch: $BRANCH"
+          fi
+          
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "deploy_branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "run_tests=$RUN_TESTS" >> $GITHUB_OUTPUT
+          
+          echo "🔧 Configurando variáveis para: $ENVIRONMENT"
           
           # Validações específicas por ambiente
-          if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+          if [ "$ENVIRONMENT" == "production" ]; then
             # Produção: branch deve ser main ou hotfix
-            if [[ "${{ github.event.inputs.branch }}" != "main" ]] && [[ "${{ github.event.inputs.branch }}" != hotfix/* ]]; then
+            if [[ "$BRANCH" != "main" ]] && [[ "$BRANCH" != hotfix/* ]]; then
               echo "❌ Produção só aceita branch 'main' ou 'hotfix/*'"
-              echo "Branch fornecida: ${{ github.event.inputs.branch }}"
+              echo "Branch fornecida: $BRANCH"
               exit 1
             fi
             
@@ -88,21 +127,22 @@ jobs:
           
           echo ""
           echo "📋 Resumo da configuração:"
-          echo "  Environment: ${{ github.event.inputs.environment }}"
-          echo "  Branch: ${{ github.event.inputs.branch }}"
-          echo "  Run Tests: ${{ github.event.inputs.run_tests }}"
-          echo "  Force Deploy: ${{ github.event.inputs.force_deploy }}"
+          echo "  Trigger: ${{ github.event_name }}"
+          echo "  Environment: $ENVIRONMENT"
+          echo "  Branch: $BRANCH"
+          echo "  Run Tests: $RUN_TESTS"
+          echo "  Actor: ${{ github.actor }}"
 
   test:
     needs: validate-inputs
     runs-on: self-hosted
-    if: ${{ github.event.inputs.run_tests == 'true' }}
+    if: ${{ needs.validate-inputs.outputs.run_tests == 'true' }}
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.branch }}
+          ref: ${{ needs.validate-inputs.outputs.deploy_branch }}
       
       - name: Setup Go
         uses: actions/setup-go@v4
@@ -120,18 +160,19 @@ jobs:
       
       - name: Run tests
         run: |
-          echo "🧪 Executando testes para ${{ github.event.inputs.environment }}..."
+          ENVIRONMENT="${{ needs.validate-inputs.outputs.environment }}"
+          echo "🧪 Executando testes para $ENVIRONMENT..."
           go mod download
           go test -v -cover -race ./...
-          go test -coverprofile=coverage-${{ github.event.inputs.environment }}.out ./...
-          go tool cover -html=coverage-${{ github.event.inputs.environment }}.out -o coverage-${{ github.event.inputs.environment }}.html
+          go test -coverprofile=coverage-$ENVIRONMENT.out ./...
+          go tool cover -html=coverage-$ENVIRONMENT.out -o coverage-$ENVIRONMENT.html
           
           # Gerar relatório de cobertura
-          coverage=$(go tool cover -func=coverage-${{ github.event.inputs.environment }}.out | grep total | awk '{print $3}')
+          coverage=$(go tool cover -func=coverage-$ENVIRONMENT.out | grep total | awk '{print $3}')
           echo "📊 Cobertura de testes: $coverage"
           
           # Critérios diferentes por ambiente
-          if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+          if [ "$ENVIRONMENT" == "production" ]; then
             if [ "${coverage%.*}" -lt 80 ]; then
               echo "❌ Cobertura abaixo de 80% - Bloqueado em PRODUÇÃO!"
               exit 1
@@ -149,32 +190,33 @@ jobs:
       - name: Upload coverage report
         uses: actions/upload-artifact@v3
         with:
-          name: coverage-report-${{ github.event.inputs.environment }}
-          path: coverage-${{ github.event.inputs.environment }}.html
+          name: coverage-report-${{ needs.validate-inputs.outputs.environment }}
+          path: coverage-${{ needs.validate-inputs.outputs.environment }}.html
 
   build-and-deploy:
     needs: [validate-inputs, test]
     runs-on: self-hosted
-    if: ${{ always() && !failure() || (failure() && github.event.inputs.force_deploy == 'true' && github.event.inputs.environment == 'homologation') }}
-    environment: ${{ github.event.inputs.environment }}
+    if: ${{ always() && !failure() || (failure() && github.event.inputs.force_deploy == 'true' && needs.validate-inputs.outputs.environment == 'homologation') }}
+    environment: ${{ needs.validate-inputs.outputs.environment }}
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.branch }}
+          ref: ${{ needs.validate-inputs.outputs.deploy_branch }}
       
       - name: Setup Minikube Environment
         run: |
           PROFILE="${{ needs.validate-inputs.outputs.minikube_profile }}"
+          ENVIRONMENT="${{ needs.validate-inputs.outputs.environment }}"
           
-          echo "🔧 Configurando ambiente: ${{ github.event.inputs.environment }}"
+          echo "🔧 Configurando ambiente: $ENVIRONMENT"
           echo "📦 Profile: $PROFILE"
           
           # Verificar se minikube está rodando
           if ! minikube status --profile=$PROFILE >/dev/null 2>&1; then
-            echo "❌ Minikube ${{ github.event.inputs.environment }} não está rodando!"
-            echo "Execute: ./scripts/setup-${{ github.event.inputs.environment }}-minikube.sh"
+            echo "❌ Minikube $ENVIRONMENT não está rodando!"
+            echo "Execute: ./scripts/setup-$ENVIRONMENT-minikube.sh"
             exit 1
           fi
           
@@ -184,7 +226,7 @@ jobs:
           # Configurar kubectl context
           kubectl config use-context $PROFILE
           
-          echo "✅ Ambiente ${{ github.event.inputs.environment }} configurado"
+          echo "✅ Ambiente $ENVIRONMENT configurado"
           echo "🔧 Context: $(kubectl config current-context)"
           echo "🌐 IP: $(minikube ip --profile=$PROFILE)"
       
@@ -192,21 +234,23 @@ jobs:
         run: |
           PROFILE="${{ needs.validate-inputs.outputs.minikube_profile }}"
           TAG_PREFIX="${{ needs.validate-inputs.outputs.image_tag_prefix }}"
+          ENVIRONMENT="${{ needs.validate-inputs.outputs.environment }}"
+          BRANCH="${{ needs.validate-inputs.outputs.deploy_branch }}"
           
           eval $(minikube docker-env --profile=$PROFILE)
           
-          echo "🐳 Construindo imagem para ${{ github.event.inputs.environment }}..."
+          echo "🐳 Construindo imagem para $ENVIRONMENT..."
           
           docker build \
             --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
             --build-arg VCS_REF=${{ github.sha }} \
-            --build-arg VERSION=${{ github.event.inputs.branch }} \
-            --build-arg ENVIRONMENT=${{ github.event.inputs.environment }} \
+            --build-arg VERSION=$BRANCH \
+            --build-arg ENVIRONMENT=$ENVIRONMENT \
             -t ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-latest \
             -t ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} \
             -t ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-$(date +%Y%m%d-%H%M%S) .
           
-          echo "✅ Imagem construída para ${{ github.event.inputs.environment }}!"
+          echo "✅ Imagem construída para $ENVIRONMENT!"
           docker images | grep ${{ env.IMAGE_NAME }}
       
       - name: Create Kubernetes Manifests

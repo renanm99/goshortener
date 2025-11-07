@@ -1,0 +1,593 @@
+name: Deploy Application
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - homologation
+          - production
+      branch:
+        description: 'Branch to deploy'
+        required: true
+        type: string
+        default: 'develop'
+      run_tests:
+        description: 'Run tests before deploy'
+        required: false
+        type: boolean
+        default: true
+      force_deploy:
+        description: 'Force deployment (skip test failures - PRD only)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: localhost:5000
+  IMAGE_NAME: goshortener
+
+jobs:
+  validate-inputs:
+    runs-on: self-hosted
+    outputs:
+      minikube_profile: ${{ steps.set-env.outputs.minikube_profile }}
+      namespace: ${{ steps.set-env.outputs.namespace }}
+      replicas: ${{ steps.set-env.outputs.replicas }}
+      image_tag_prefix: ${{ steps.set-env.outputs.image_tag_prefix }}
+      log_level: ${{ steps.set-env.outputs.log_level }}
+      memory_request: ${{ steps.set-env.outputs.memory_request }}
+      memory_limit: ${{ steps.set-env.outputs.memory_limit }}
+      cpu_request: ${{ steps.set-env.outputs.cpu_request }}
+      cpu_limit: ${{ steps.set-env.outputs.cpu_limit }}
+    
+    steps:
+      - name: Validate and Set Environment Variables
+        id: set-env
+        run: |
+          echo "🔧 Configurando variáveis para: ${{ github.event.inputs.environment }}"
+          
+          # Validações específicas por ambiente
+          if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+            # Produção: branch deve ser main ou hotfix
+            if [[ "${{ github.event.inputs.branch }}" != "main" ]] && [[ "${{ github.event.inputs.branch }}" != hotfix/* ]]; then
+              echo "❌ Produção só aceita branch 'main' ou 'hotfix/*'"
+              echo "Branch fornecida: ${{ github.event.inputs.branch }}"
+              exit 1
+            fi
+            
+            echo "minikube_profile=prd" >> $GITHUB_OUTPUT
+            echo "namespace=goshortener-prd" >> $GITHUB_OUTPUT
+            echo "replicas=3" >> $GITHUB_OUTPUT
+            echo "image_tag_prefix=prd" >> $GITHUB_OUTPUT
+            echo "log_level=info" >> $GITHUB_OUTPUT
+            echo "memory_request=256Mi" >> $GITHUB_OUTPUT
+            echo "memory_limit=512Mi" >> $GITHUB_OUTPUT
+            echo "cpu_request=250m" >> $GITHUB_OUTPUT
+            echo "cpu_limit=500m" >> $GITHUB_OUTPUT
+            
+            echo "✅ Configuração de PRODUÇÃO aplicada"
+            
+          else
+            # Homologação: aceita qualquer branch
+            echo "minikube_profile=hml" >> $GITHUB_OUTPUT
+            echo "namespace=goshortener-hml" >> $GITHUB_OUTPUT
+            echo "replicas=2" >> $GITHUB_OUTPUT
+            echo "image_tag_prefix=hml" >> $GITHUB_OUTPUT
+            echo "log_level=debug" >> $GITHUB_OUTPUT
+            echo "memory_request=128Mi" >> $GITHUB_OUTPUT
+            echo "memory_limit=256Mi" >> $GITHUB_OUTPUT
+            echo "cpu_request=100m" >> $GITHUB_OUTPUT
+            echo "cpu_limit=300m" >> $GITHUB_OUTPUT
+            
+            echo "✅ Configuração de HOMOLOGAÇÃO aplicada"
+          fi
+          
+          echo ""
+          echo "📋 Resumo da configuração:"
+          echo "  Environment: ${{ github.event.inputs.environment }}"
+          echo "  Branch: ${{ github.event.inputs.branch }}"
+          echo "  Run Tests: ${{ github.event.inputs.run_tests }}"
+          echo "  Force Deploy: ${{ github.event.inputs.force_deploy }}"
+
+  test:
+    needs: validate-inputs
+    runs-on: self-hosted
+    if: ${{ github.event.inputs.run_tests == 'true' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ github.event.inputs.environment }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ github.event.inputs.environment }}-
+            ${{ runner.os }}-go-
+      
+      - name: Run tests
+        run: |
+          echo "🧪 Executando testes para ${{ github.event.inputs.environment }}..."
+          go mod download
+          go test -v -cover -race ./...
+          go test -coverprofile=coverage-${{ github.event.inputs.environment }}.out ./...
+          go tool cover -html=coverage-${{ github.event.inputs.environment }}.out -o coverage-${{ github.event.inputs.environment }}.html
+          
+          # Gerar relatório de cobertura
+          coverage=$(go tool cover -func=coverage-${{ github.event.inputs.environment }}.out | grep total | awk '{print $3}')
+          echo "📊 Cobertura de testes: $coverage"
+          
+          # Critérios diferentes por ambiente
+          if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+            if [ "${coverage%.*}" -lt 80 ]; then
+              echo "❌ Cobertura abaixo de 80% - Bloqueado em PRODUÇÃO!"
+              exit 1
+            else
+              echo "✅ Cobertura adequada para produção (>80%)"
+            fi
+          else
+            if [ "${coverage%.*}" -lt 80 ]; then
+              echo "⚠️ Cobertura abaixo de 80% - Deploy permitido em HML mas verificar"
+            else
+              echo "✅ Cobertura adequada para homologação"
+            fi
+          fi
+      
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report-${{ github.event.inputs.environment }}
+          path: coverage-${{ github.event.inputs.environment }}.html
+
+  build-and-deploy:
+    needs: [validate-inputs, test]
+    runs-on: self-hosted
+    if: ${{ always() && !failure() || (failure() && github.event.inputs.force_deploy == 'true' && github.event.inputs.environment == 'homologation') }}
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+      
+      - name: Setup Minikube Environment
+        run: |
+          PROFILE="${{ needs.validate-inputs.outputs.minikube_profile }}"
+          
+          echo "🔧 Configurando ambiente: ${{ github.event.inputs.environment }}"
+          echo "📦 Profile: $PROFILE"
+          
+          # Verificar se minikube está rodando
+          if ! minikube status --profile=$PROFILE >/dev/null 2>&1; then
+            echo "❌ Minikube ${{ github.event.inputs.environment }} não está rodando!"
+            echo "Execute: ./scripts/setup-${{ github.event.inputs.environment }}-minikube.sh"
+            exit 1
+          fi
+          
+          # Configurar docker para usar registry do minikube
+          eval $(minikube docker-env --profile=$PROFILE)
+          
+          # Configurar kubectl context
+          kubectl config use-context $PROFILE
+          
+          echo "✅ Ambiente ${{ github.event.inputs.environment }} configurado"
+          echo "🔧 Context: $(kubectl config current-context)"
+          echo "🌐 IP: $(minikube ip --profile=$PROFILE)"
+      
+      - name: Build Docker Image
+        run: |
+          PROFILE="${{ needs.validate-inputs.outputs.minikube_profile }}"
+          TAG_PREFIX="${{ needs.validate-inputs.outputs.image_tag_prefix }}"
+          
+          eval $(minikube docker-env --profile=$PROFILE)
+          
+          echo "🐳 Construindo imagem para ${{ github.event.inputs.environment }}..."
+          
+          docker build \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg VERSION=${{ github.event.inputs.branch }} \
+            --build-arg ENVIRONMENT=${{ github.event.inputs.environment }} \
+            -t ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-latest \
+            -t ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} \
+            -t ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-$(date +%Y%m%d-%H%M%S) .
+          
+          echo "✅ Imagem construída para ${{ github.event.inputs.environment }}!"
+          docker images | grep ${{ env.IMAGE_NAME }}
+      
+      - name: Create Kubernetes Manifests
+        run: |
+          NAMESPACE="${{ needs.validate-inputs.outputs.namespace }}"
+          REPLICAS="${{ needs.validate-inputs.outputs.replicas }}"
+          TAG_PREFIX="${{ needs.validate-inputs.outputs.image_tag_prefix }}"
+          LOG_LEVEL="${{ needs.validate-inputs.outputs.log_level }}"
+          MEM_REQ="${{ needs.validate-inputs.outputs.memory_request }}"
+          MEM_LIM="${{ needs.validate-inputs.outputs.memory_limit }}"
+          CPU_REQ="${{ needs.validate-inputs.outputs.cpu_request }}"
+          CPU_LIM="${{ needs.validate-inputs.outputs.cpu_limit }}"
+          
+          mkdir -p k8s/${{ github.event.inputs.environment }}
+          
+          echo "📝 Gerando manifests para ${{ github.event.inputs.environment }}..."
+          
+          # Deployment
+          cat > k8s/${{ github.event.inputs.environment }}/deployment.yaml <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: goshortener
+            namespace: ${NAMESPACE}
+            labels:
+              app: goshortener
+              version: v1
+              environment: ${{ github.event.inputs.environment }}
+          spec:
+            replicas: ${REPLICAS}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0
+            selector:
+              matchLabels:
+                app: goshortener
+            template:
+              metadata:
+                labels:
+                  app: goshortener
+                  version: v1
+                  environment: ${{ github.event.inputs.environment }}
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "8080"
+                  prometheus.io/path: "/metrics"
+                  deployment.time: "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+                  deployment.by: "${{ github.actor }}"
+              spec:
+                containers:
+                - name: goshortener
+                  image: ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }}
+                  imagePullPolicy: IfNotPresent
+                  ports:
+                  - containerPort: 8080
+                    name: http
+                    protocol: TCP
+                  env:
+                  - name: PORT
+                    value: "8080"
+                  - name: ENVIRONMENT
+                    value: "${{ github.event.inputs.environment }}"
+                  - name: LOG_LEVEL
+                    value: "${LOG_LEVEL}"
+                  - name: GIT_BRANCH
+                    value: "${{ github.event.inputs.branch }}"
+                  - name: GIT_COMMIT
+                    value: "${{ github.sha }}"
+                  resources:
+                    requests:
+                      memory: "${MEM_REQ}"
+                      cpu: "${CPU_REQ}"
+                    limits:
+                      memory: "${MEM_LIM}"
+                      cpu: "${CPU_LIM}"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 15
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  readinessProbe:
+                    httpGet:
+                      path: /ready
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                    failureThreshold: 2
+                  volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+                volumes:
+                - name: tmp
+                  emptyDir: {}
+          EOF
+          
+          # Service
+          cat > k8s/${{ github.event.inputs.environment }}/service.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: goshortener
+            namespace: ${NAMESPACE}
+            labels:
+              app: goshortener
+              environment: ${{ github.event.inputs.environment }}
+          spec:
+            selector:
+              app: goshortener
+            ports:
+            - port: 80
+              targetPort: 8080
+              protocol: TCP
+              name: http
+            type: ClusterIP
+          EOF
+          
+          # Ingress
+          cat > k8s/${{ github.event.inputs.environment }}/ingress.yaml <<EOF
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: goshortener
+            namespace: ${NAMESPACE}
+            annotations:
+              nginx.ingress.kubernetes.io/rewrite-target: /
+              nginx.ingress.kubernetes.io/ssl-redirect: "false"
+              nginx.ingress.kubernetes.io/configuration-snippet: |
+                add_header X-Environment "${{ github.event.inputs.environment }}" always;
+                add_header X-Branch "${{ github.event.inputs.branch }}" always;
+                add_header X-Commit "${{ github.sha }}" always;
+          spec:
+            ingressClassName: nginx
+            rules:
+            - http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: goshortener
+                      port:
+                        number: 80
+          EOF
+          
+          echo "✅ Manifests gerados!"
+      
+      - name: Deploy to Kubernetes
+        run: |
+          PROFILE="${{ needs.validate-inputs.outputs.minikube_profile }}"
+          NAMESPACE="${{ needs.validate-inputs.outputs.namespace }}"
+          
+          echo "🚀 Iniciando deploy para ${{ github.event.inputs.environment }}..."
+          
+          # Usar contexto do minikube
+          kubectl config use-context $PROFILE
+          
+          # Verificar se namespace existe
+          kubectl get namespace $NAMESPACE || kubectl create namespace $NAMESPACE
+          
+          # Aplicar labels no namespace
+          kubectl label namespace $NAMESPACE environment=${{ github.event.inputs.environment }} --overwrite
+          
+          # Deploy usando manifests
+          kubectl apply -f k8s/${{ github.event.inputs.environment }}/deployment.yaml
+          kubectl apply -f k8s/${{ github.event.inputs.environment }}/service.yaml
+          kubectl apply -f k8s/${{ github.event.inputs.environment }}/ingress.yaml
+          
+          # Timeout diferente por ambiente
+          TIMEOUT="180s"
+          if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+            TIMEOUT="300s"
+          fi
+          
+          # Aguardar rollout
+          kubectl rollout status deployment/goshortener -n $NAMESPACE --timeout=$TIMEOUT
+          
+          echo "✅ Deploy para ${{ github.event.inputs.environment }} realizado!"
+      
+      - name: Integration Tests
+        run: |
+          PROFILE="${{ needs.validate-inputs.outputs.minikube_profile }}"
+          NAMESPACE="${{ needs.validate-inputs.outputs.namespace }}"
+          
+          echo "🧪 Executando testes de integração..."
+          
+          # Aguardar pods estarem prontos
+          kubectl wait --for=condition=ready pod -l app=goshortener -n $NAMESPACE --timeout=120s
+          
+          # Obter URL do ingress
+          INGRESS_IP=$(minikube ip --profile=$PROFILE)
+          echo "🔗 Testing application at: http://$INGRESS_IP"
+          
+          # Teste de saúde com retry
+          MAX_ATTEMPTS=10
+          if [ "${{ github.event.inputs.environment }}" == "homologation" ]; then
+            MAX_ATTEMPTS=8
+          fi
+          
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            if curl -f --connect-timeout 10 http://$INGRESS_IP/health 2>/dev/null; then
+              echo "✅ Health check passou na tentativa $i!"
+              break
+            else
+              echo "⏳ Tentativa $i/$MAX_ATTEMPTS falhou, aguardando 10s..."
+              sleep 10
+            fi
+            
+            if [ $i -eq $MAX_ATTEMPTS ]; then
+              echo "❌ Health check falhou após $MAX_ATTEMPTS tentativas"
+              kubectl get pods -n $NAMESPACE
+              kubectl logs -l app=goshortener -n $NAMESPACE --tail=20
+              
+              if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+                exit 1
+              else
+                echo "⚠️ Continuando em homologação apesar da falha..."
+              fi
+            fi
+          done
+          
+          # Mostrar status dos recursos
+          echo "📊 Status dos recursos em ${{ github.event.inputs.environment }}:"
+          kubectl get pods,svc,ingress -n $NAMESPACE
+      
+      - name: Functional Tests
+        run: |
+          PROFILE="${{ needs.validate-inputs.outputs.minikube_profile }}"
+          INGRESS_IP=$(minikube ip --profile=$PROFILE)
+          
+          echo "🔧 Executando testes funcionais em ${{ github.event.inputs.environment }}..."
+          
+          # Teste de encurtamento
+          echo "📝 Teste 1: Encurtamento de URL"
+          response=$(curl -s -X POST http://$INGRESS_IP/shorten \
+            -H "Content-Type: application/json" \
+            -d '{"url":"https://github.com/renanm99/goshortener"}' || echo "ERROR")
+          
+          if echo "$response" | grep -q "short_id"; then
+            echo "✅ Teste de encurtamento passou!"
+            short_id=$(echo "$response" | grep -o '"short_id":"[^"]*"' | cut -d'"' -f4)
+            echo "🔗 Short ID gerado: $short_id"
+            
+            # Teste de redirecionamento
+            echo "🔄 Teste 2: Redirecionamento"
+            redirect_response=$(curl -s -I http://$INGRESS_IP/$short_id || echo "ERROR")
+            if echo "$redirect_response" | grep -q "301\|302"; then
+              echo "✅ Teste de redirecionamento passou!"
+            else
+              echo "⚠️ Teste de redirecionamento falhou"
+              if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+                exit 1
+              fi
+            fi
+            
+            # Teste de URL inválida
+            echo "❌ Teste 3: URL Inválida"
+            invalid_response=$(curl -s -X POST http://$INGRESS_IP/shorten \
+              -H "Content-Type: application/json" \
+              -d '{"url":"invalid-url"}' || echo "ERROR")
+            
+            if echo "$invalid_response" | grep -q "error\|Error"; then
+              echo "✅ Teste de validação passou!"
+            else
+              echo "⚠️ Validação pode ter problemas"
+            fi
+            
+          else
+            echo "⚠️ Teste de encurtamento falhou"
+            echo "Response: $response"
+            if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+              exit 1
+            else
+              echo "Continuando... (não crítico em homologação)"
+            fi
+          fi
+      
+      - name: Performance Test
+        run: |
+          PROFILE="${{ needs.validate-inputs.outputs.minikube_profile }}"
+          INGRESS_IP=$(minikube ip --profile=$PROFILE)
+          
+          echo "⚡ Teste de performance em ${{ github.event.inputs.environment }}..."
+          
+          total_time=0
+          successful_requests=0
+          NUM_REQUESTS=5
+          
+          if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+            NUM_REQUESTS=10
+          fi
+          
+          for i in $(seq 1 $NUM_REQUESTS); do
+            start_time=$(date +%s%N)
+            if curl -s -f http://$INGRESS_IP/health >/dev/null 2>&1; then
+              end_time=$(date +%s%N)
+              response_time=$(((end_time - start_time) / 1000000))
+              echo "Request $i: ${response_time}ms ✅"
+              total_time=$((total_time + response_time))
+              successful_requests=$((successful_requests + 1))
+            else
+              echo "Request $i: FAILED ❌"
+            fi
+          done
+          
+          if [ $successful_requests -gt 0 ]; then
+            avg_time=$((total_time / successful_requests))
+            echo "📊 Média de resposta: ${avg_time}ms"
+            echo "📈 Requests bem-sucedidos: $successful_requests/$NUM_REQUESTS"
+          fi
+      
+      - name: Deployment Summary
+        if: always()
+        run: |
+          PROFILE="${{ needs.validate-inputs.outputs.minikube_profile }}"
+          NAMESPACE="${{ needs.validate-inputs.outputs.namespace }}"
+          INGRESS_IP=$(minikube ip --profile=$PROFILE)
+          
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║       DEPLOYMENT SUMMARY - ${{ github.event.inputs.environment }}                      ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "📋 INFORMAÇÕES DO DEPLOY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🌐 Ambiente:       ${{ github.event.inputs.environment }}"
+          echo "📦 Cluster:        $PROFILE"
+          echo "🏷️  Namespace:      $NAMESPACE"
+          echo "🌿 Branch:         ${{ github.event.inputs.branch }}"
+          echo "🔖 Commit:         ${{ github.sha }}"
+          echo "👤 Deployed by:    ${{ github.actor }}"
+          echo "⏰ Deploy time:    $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "🔗 URL:            http://$INGRESS_IP"
+          echo ""
+          echo "📊 CONFIGURAÇÃO DE RECURSOS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔄 Replicas:       ${{ needs.validate-inputs.outputs.replicas }}"
+          echo "💾 Memory:         ${{ needs.validate-inputs.outputs.memory_request }} / ${{ needs.validate-inputs.outputs.memory_limit }}"
+          echo "⚙️  CPU:            ${{ needs.validate-inputs.outputs.cpu_request }} / ${{ needs.validate-inputs.outputs.cpu_limit }}"
+          echo "📝 Log Level:      ${{ needs.validate-inputs.outputs.log_level }}"
+          echo ""
+          echo "🎯 PRÓXIMOS PASSOS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          if [ "${{ github.event.inputs.environment }}" == "homologation" ]; then
+            echo "   1. Testar manualmente: http://$INGRESS_IP"
+            echo "   2. Executar testes E2E se necessário"
+            echo "   3. Validar com stakeholders"
+            echo "   4. Se aprovado, promover para produção"
+          else
+            echo "   1. Monitorar métricas: ./scripts/monitor-production.sh"
+            echo "   2. Verificar logs: kubectl logs -l app=goshortener -n $NAMESPACE"
+            echo "   3. Acompanhar saúde: watch kubectl get pods -n $NAMESPACE"
+            echo "   4. Dashboard: minikube dashboard --profile=$PROFILE"
+          fi
+          
+          echo ""
+          echo "📈 STATUS DOS RECURSOS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          kubectl get pods,svc,ingress -n $NAMESPACE
+      
+      - name: Cleanup Old Images
+        if: always()
+        run: |
+          PROFILE="${{ needs.validate-inputs.outputs.minikube_profile }}"
+          TAG_PREFIX="${{ needs.validate-inputs.outputs.image_tag_prefix }}"
+          
+          eval $(minikube docker-env --profile=$PROFILE)
+          
+          # Manter mais imagens em produção (5) vs homologação (3)
+          KEEP_IMAGES=3
+          if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+            KEEP_IMAGES=5
+          fi
+          
+          docker images ${{ env.IMAGE_NAME }} --format "table {{.Repository}}:{{.Tag}}\t{{.CreatedAt}}" | \
+            grep "${TAG_PREFIX}-" | grep -v "${TAG_PREFIX}-latest" | tail -n +$((KEEP_IMAGES + 1)) | awk '{print $1}' | \
+            xargs -r docker rmi || true
+          
+          echo "🧹 Limpeza de imagens ${{ github.event.inputs.environment }} concluída (mantidas: $KEEP_IMAGES)"

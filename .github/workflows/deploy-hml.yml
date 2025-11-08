@@ -8,16 +8,6 @@ on:
         required: true
         type: string
         default: 'develop'
-  
-  push:
-    branches:
-      - develop
-      - 'feature/**'
-      - 'bugfix/**'
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.gitignore'
 
 env:
   REGISTRY: localhost:5000

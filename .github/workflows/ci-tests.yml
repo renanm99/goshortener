@@ -54,7 +54,7 @@ jobs:
       cpu_request: ${{ steps.set-env.outputs.cpu_request }}
       cpu_limit: ${{ steps.set-env.outputs.cpu_limit }}
       environment: ${{ steps.set-env.outputs.environment }}
-      deploy_branch: ${{ steps.set-env.outputs.deploy_branch }}
+      test_branch: ${{ steps.set-env.outputs.test_branch }}
     
     steps:
       - name: Determine Environment and Branch
@@ -64,16 +64,16 @@ jobs:
           if [ "${{ github.event_name }}" == "push" ]; then
             ENV="homologation"
             BRANCH="${{ github.ref_name }}"
-            echo "🔄 Deploy automático via push"
+            echo "🔄 Teste automático via push"
           else
             # Se foi manual
             ENV="${{ github.event.inputs.environment }}"
             BRANCH="${{ github.event.inputs.branch }}"
-            echo "👤 Deploy manual"
+            echo "👤 Teste manual"
           fi
           
           echo "environment=$ENV" >> $GITHUB_OUTPUT
-          echo "deploy_branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "test_branch=$BRANCH" >> $GITHUB_OUTPUT
           
           echo "🔧 Configurando para: $ENV (branch: $BRANCH)"
           
@@ -128,7 +128,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.setup.outputs.deploy_branch }}
+          ref: ${{ needs.setup.outputs.test_branch }}
       
       - name: Setup Go
         uses: actions/setup-go@v4
@@ -166,7 +166,7 @@ jobs:
             fi
           else
             if [ "${coverage%.*}" -lt 80 ]; then
-              echo "⚠️ Cobertura abaixo de 80% - Deploy permitido em HML"
+              echo "⚠️ Cobertura abaixo de 80% - Teste continua em HML"
             else
               echo "✅ Cobertura adequada"
             fi
@@ -178,7 +178,7 @@ jobs:
           name: coverage-report-${{ needs.setup.outputs.environment }}
           path: coverage.html
 
-  deploy:
+  validate:
     needs: [setup, test]
     runs-on: ubuntu-latest
     if: ${{ always() && !failure() || (failure() && github.event.inputs.force_deploy == 'true' && needs.setup.outputs.environment == 'homologation') }}
@@ -188,7 +188,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.setup.outputs.deploy_branch }}
+          ref: ${{ needs.setup.outputs.test_branch }}
       
       - name: Install Kind
         run: |
@@ -254,13 +254,13 @@ jobs:
           
           echo "✅ Imagem pronta: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }}"
       
-      - name: Deploy to Kubernetes
+      - name: Test Kubernetes Deployment
         run: |
           CLUSTER_NAME="${{ needs.setup.outputs.cluster_name }}"
           NAMESPACE="${{ needs.setup.outputs.namespace }}"
           TAG_PREFIX="${{ needs.setup.outputs.image_tag_prefix }}"
           
-          echo "🚀 Deploy para ${{ needs.setup.outputs.environment }}..."
+          echo "🧪 Testando deployment no Kind temporário..."
           
           kubectl config use-context kind-${CLUSTER_NAME}
           
@@ -288,30 +288,30 @@ jobs:
           
           echo "✅ Deploy concluído!"
       
-      - name: Verify Deployment
+      - name: Verify Test Deployment
         run: |
           NAMESPACE="${{ needs.setup.outputs.namespace }}"
           
-          echo "🔍 Verificando deployment..."
+          echo "🔍 Verificando deployment de teste..."
           kubectl get pods,svc -n $NAMESPACE
           kubectl wait --for=condition=ready pod -l app=goshortener -n $NAMESPACE --timeout=120s || true
       
-      - name: Deployment Summary
+      - name: Test Summary
         run: |
           CLUSTER_NAME="${{ needs.setup.outputs.cluster_name }}"
           NAMESPACE="${{ needs.setup.outputs.namespace }}"
           
           echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║       DEPLOYMENT SUMMARY                                      ║"
+          echo "║       CI TEST SUMMARY                                         ║"
           echo "╚══════════════════════════════════════════════════════════════╝"
           echo ""
           echo "🌐 Ambiente:       ${{ needs.setup.outputs.environment }}"
-          echo "📦 Cluster:        $CLUSTER_NAME"
+          echo "📦 Cluster:        $CLUSTER_NAME (temporário)"
           echo "🏷️  Namespace:      $NAMESPACE"
-          echo "🌿 Branch:         ${{ needs.setup.outputs.deploy_branch }}"
+          echo "🌿 Branch:         ${{ needs.setup.outputs.test_branch }}"
           echo "🔖 Commit:         ${{ github.sha }}"
-          echo "👤 Deployed by:    ${{ github.actor }}"
-          echo "⏰ Deploy time:    $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "👤 Tested by:      ${{ github.actor }}"
+          echo "⏰ Test time:      $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           echo ""
           echo "📊 Recursos:"
           kubectl get pods,svc,deploy -n $NAMESPACE

@@ -1,5 +1,5 @@
-# Start from the official Go image
-FROM golang:1.25 as builder
+# Build stage
+FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
@@ -10,18 +10,32 @@ RUN go mod download
 # Copy the source code
 COPY . .
 
-# Build the Go app
-RUN go build -o shortener ./cmd/shortener
+# Build the Go app with optimizations
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o shortener ./cmd/shortener
 
-# Start a minimal image
-FROM ubuntu:latest
+# Runtime stage - minimal image
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates
+
 WORKDIR /app
 
 # Copy the binary from the builder
 COPY --from=builder /app/shortener ./shortener
 
-# Expose the port (change if your app uses a different port)
+# Create non-root user
+RUN addgroup -g 1000 appuser && \
+    adduser -D -u 1000 -G appuser appuser && \
+    chown -R appuser:appuser /app
+
+USER appuser
+
+# Expose the port
 EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
 
 # Run the binary
 CMD ["./shortener"]

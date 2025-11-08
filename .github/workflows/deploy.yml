@@ -42,7 +42,7 @@ env:
 
 jobs:
   setup:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       cluster_name: ${{ steps.set-env.outputs.cluster_name }}
       namespace: ${{ steps.set-env.outputs.namespace }}
@@ -121,7 +121,7 @@ jobs:
 
   test:
     needs: setup
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     if: ${{ github.event.inputs.run_tests != 'false' }}
     
     steps:
@@ -180,7 +180,7 @@ jobs:
 
   deploy:
     needs: [setup, test]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     if: ${{ always() && !failure() || (failure() && github.event.inputs.force_deploy == 'true' && needs.setup.outputs.environment == 'homologation') }}
     environment: ${{ needs.setup.outputs.environment }}
     
@@ -190,21 +190,47 @@ jobs:
         with:
           ref: ${{ needs.setup.outputs.deploy_branch }}
       
-      - name: Verify Kind Cluster
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+      
+      - name: Create Kind Cluster
         run: |
           CLUSTER_NAME="${{ needs.setup.outputs.cluster_name }}"
           
-          echo "🔧 Verificando Kind cluster: $CLUSTER_NAME"
+          echo "🔧 Criando Kind cluster: $CLUSTER_NAME"
           
-          if ! kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
-            echo "❌ Kind cluster '$CLUSTER_NAME' não existe!"
-            echo "Clusters disponíveis:"
-            kind get clusters
-            exit 1
-          fi
+          cat <<EOF | kind create cluster --name ${CLUSTER_NAME} --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            extraPortMappings:
+            - containerPort: 80
+              hostPort: 8080
+              protocol: TCP
+          - role: worker
+          containerdConfigPatches:
+          - |-
+            [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5000"]
+              endpoint = ["http://registry:5000"]
+          EOF
           
           kubectl cluster-info --context kind-${CLUSTER_NAME}
-          echo "✅ Cluster verificado!"
+          echo "✅ Cluster criado!"
+      
+      - name: Setup Local Registry
+        run: |
+          # Criar registry local
+          docker run -d --restart=always -p 5000:5000 --name registry registry:2
+          
+          # Conectar registry ao network do kind
+          docker network connect kind registry
+          
+          echo "✅ Registry configurado em localhost:5000"
       
       - name: Build and Push Image
         run: |

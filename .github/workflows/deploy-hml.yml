@@ -64,8 +64,58 @@ jobs:
           path: image.tar.gz
           retention-days: 1
 
-  deploy:
+  test:
     needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref_name }}
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-hml-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-hml-
+            ${{ runner.os }}-go-
+      
+      - name: Run tests
+        run: |
+          echo "🧪 Executando testes para HOMOLOGAÇÃO..."
+          go mod download
+          go test -v -cover -race ./...
+          
+          echo "📊 Gerando relatório de cobertura..."
+          go test -coverprofile=coverage.out ./...
+          go tool cover -html=coverage.out -o coverage.html
+          
+          coverage=$(go tool cover -func=coverage.out | grep total | awk '{print $3}')
+          echo "📊 Cobertura de testes: $coverage"
+          
+          # HML: avisar se cobertura baixa, mas não bloquear
+          if [ "${coverage%.*}" -lt 80 ]; then
+            echo "⚠️ Cobertura abaixo de 80% - Deploy continua em HML"
+          else
+            echo "✅ Cobertura adequada"
+          fi
+      
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-hml
+          path: coverage.html
+
+  deploy:
+    needs: [build, test]
     runs-on: ubuntu-latest
     environment: homologation
     
@@ -80,25 +130,40 @@ jobs:
         with:
           name: docker-image-hml
       
+      - name: Setup Cloudflare Tunnel
+        run: |
+          # Install cloudflared
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+          
+          echo "✅ Cloudflared instalado!"
+      
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           
-          # Add host to known_hosts
-          ssh-keyscan -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          # Configure SSH for Cloudflare Tunnel
+          cat >> ~/.ssh/config <<EOF
+          Host cf-ssh
+            Hostname ${{ secrets.SSH_HOST }}
+            User ${{ secrets.SSH_USER }}
+            PubkeyAuthentication yes
+            ProxyCommand cloudflared access ssh --hostname %h
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking no
+          EOF
           
-          echo "✅ SSH configurado!"
+          chmod 600 ~/.ssh/config
+          
+          echo "✅ SSH configurado para Cloudflare Tunnel!"
       
       - name: Transfer Docker Image
         run: |
           echo "📤 Transferindo imagem para servidor HML..."
           
-          scp -i ~/.ssh/deploy_key \
-            -P ${{ secrets.SSH_PORT || '22' }} \
-            image.tar.gz \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/goshortener-hml-image.tar.gz
+          scp image.tar.gz cf-ssh:/tmp/goshortener-hml-image.tar.gz
           
           echo "✅ Imagem transferida!"
       
@@ -106,10 +171,7 @@ jobs:
         run: |
           echo "🚀 Executando deploy em HOMOLOGAÇÃO..."
           
-          ssh -i ~/.ssh/deploy_key \
-            -p ${{ secrets.SSH_PORT || '22' }} \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            bash -s <<'EOF'
+          ssh cf-ssh bash -s <<'EOF'
           
           set -e
           

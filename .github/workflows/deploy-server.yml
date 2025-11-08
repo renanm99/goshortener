@@ -99,8 +99,60 @@ jobs:
           path: image.tar.gz
           retention-days: 1
 
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-prd-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-prd-
+            ${{ runner.os }}-go-
+      
+      - name: Run tests
+        run: |
+          echo "🧪 Executando testes para PRODUÇÃO..."
+          go mod download
+          go test -v -cover -race ./...
+          
+          echo "📊 Gerando relatório de cobertura..."
+          go test -coverprofile=coverage.out ./...
+          go tool cover -html=coverage.out -o coverage.html
+          
+          coverage=$(go tool cover -func=coverage.out | grep total | awk '{print $3}')
+          echo "📊 Cobertura de testes: $coverage"
+          
+          # PRODUÇÃO: exigir cobertura mínima de 80%
+          if [ "${coverage%.*}" -lt 80 ]; then
+            echo "❌ Cobertura abaixo de 80% - BLOQUEADO EM PRODUÇÃO!"
+            exit 1
+          else
+            echo "✅ Cobertura adequada para produção (≥80%)"
+          fi
+      
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-prd
+          path: coverage.html
+          retention-days: 7
+
   deploy:
-    needs: [validate, build]
+    needs: [validate, build, test]
     runs-on: ubuntu-latest
     environment: production
     
@@ -115,25 +167,40 @@ jobs:
         with:
           name: docker-image
       
+      - name: Setup Cloudflare Tunnel
+        run: |
+          # Install cloudflared
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+          
+          echo "✅ Cloudflared instalado!"
+      
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           
-          # Add host to known_hosts
-          ssh-keyscan -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          # Configure SSH for Cloudflare Tunnel
+          cat >> ~/.ssh/config <<EOF
+          Host cf-ssh
+            Hostname ${{ secrets.SSH_HOST }}
+            User ${{ secrets.SSH_USER }}
+            PubkeyAuthentication yes
+            ProxyCommand cloudflared access ssh --hostname %h
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking no
+          EOF
           
-          echo "✅ SSH configurado!"
+          chmod 600 ~/.ssh/config
+          
+          echo "✅ SSH configurado para Cloudflare Tunnel!"
       
       - name: Transfer Docker Image
         run: |
           echo "📤 Transferindo imagem para servidor PRODUÇÃO..."
           
-          scp -i ~/.ssh/deploy_key \
-            -P ${{ secrets.SSH_PORT || '22' }} \
-            image.tar.gz \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/goshortener-prd-image.tar.gz
+          scp image.tar.gz cf-ssh:/tmp/goshortener-prd-image.tar.gz
           
           echo "✅ Imagem transferida!"
       
@@ -142,10 +209,7 @@ jobs:
           echo "🚀 Executando deploy em PRODUÇÃO..."
           echo "⚠️  ATENÇÃO: Deploy em ambiente de PRODUÇÃO!"
           
-          ssh -i ~/.ssh/deploy_key \
-            -p ${{ secrets.SSH_PORT || '22' }} \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            bash -s <<'EOF'
+          ssh cf-ssh bash -s <<'EOF'
           
           set -e
           

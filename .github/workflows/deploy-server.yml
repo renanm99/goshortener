@@ -15,6 +15,10 @@ on:
         required: true
         type: string
         default: 'develop'
+      confirmation:
+        description: 'For PRODUCTION: type "DEPLOY-TO-PRODUCTION"'
+        required: false
+        type: string
 
 env:
   REGISTRY: localhost:5000
@@ -42,6 +46,14 @@ jobs:
           
           # Validações específicas por ambiente
           if [ "$ENV" == "production" ]; then
+            # Validar confirmação para produção
+            if [ "${{ github.event.inputs.confirmation }}" != "DEPLOY-TO-PRODUCTION" ]; then
+              echo "❌ Deploy em PRODUÇÃO requer confirmação!"
+              echo "Digite exatamente: DEPLOY-TO-PRODUCTION"
+              exit 1
+            fi
+            echo "✅ Confirmação de produção validada"
+            
             # Produção: branch deve ser main ou hotfix
             if [[ "$BRANCH" != "main" ]] && [[ "$BRANCH" != hotfix/* ]]; then
               echo "❌ Produção só aceita branch 'main' ou 'hotfix/*'"

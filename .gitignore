@@ -44,4 +44,3 @@ scripts/
 # Build artifacts
 bin/
 dist/
-shortener

@@ -3,82 +3,60 @@ name: Deploy to Server (SSH)
 on:
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Target environment'
+      branch:
+        description: 'Branch to deploy (only main allowed)'
         required: true
         type: choice
         options:
-          - homologation
-          - production
-      branch:
-        description: 'Branch to deploy'
-        required: true
-        type: string
-        default: 'develop'
+          - main
       confirmation:
-        description: 'For PRODUCTION: type "DEPLOY-TO-PRODUCTION"'
-        required: false
+        description: 'Type "DEPLOY-TO-PRODUCTION" to confirm'
+        required: true
         type: string
 
 env:
   REGISTRY: localhost:5000
   IMAGE_NAME: goshortener
+  ENVIRONMENT: production
+  CLUSTER_NAME: goshortener-prd
+  NAMESPACE: goshortener-prd
+  REPLICAS: 3
 
 jobs:
-  setup:
+  validate:
     runs-on: ubuntu-latest
-    outputs:
-      cluster_name: ${{ steps.set-env.outputs.cluster_name }}
-      namespace: ${{ steps.set-env.outputs.namespace }}
-      replicas: ${{ steps.set-env.outputs.replicas }}
-      image_tag_prefix: ${{ steps.set-env.outputs.image_tag_prefix }}
-      ssh_host: ${{ steps.set-env.outputs.ssh_host }}
-      ssh_port: ${{ steps.set-env.outputs.ssh_port }}
     
     steps:
-      - name: Set Environment Variables
-        id: set-env
+      - name: Validate Production Deploy
         run: |
-          ENV="${{ github.event.inputs.environment }}"
           BRANCH="${{ github.event.inputs.branch }}"
           
-          echo "🔧 Configurando deploy para: $ENV (branch: $BRANCH)"
+          echo "🔧 Validando deploy de PRODUÇÃO (branch: $BRANCH)"
           
-          # Validações específicas por ambiente
-          if [ "$ENV" == "production" ]; then
-            # Validar confirmação para produção
-            if [ "${{ github.event.inputs.confirmation }}" != "DEPLOY-TO-PRODUCTION" ]; then
-              echo "❌ Deploy em PRODUÇÃO requer confirmação!"
-              echo "Digite exatamente: DEPLOY-TO-PRODUCTION"
-              exit 1
-            fi
-            echo "✅ Confirmação de produção validada"
-            
-            # Produção: branch deve ser main ou hotfix
-            if [[ "$BRANCH" != "main" ]] && [[ "$BRANCH" != hotfix/* ]]; then
-              echo "❌ Produção só aceita branch 'main' ou 'hotfix/*'"
-              exit 1
-            fi
-            
-            echo "cluster_name=goshortener-prd" >> $GITHUB_OUTPUT
-            echo "namespace=goshortener-prd" >> $GITHUB_OUTPUT
-            echo "replicas=3" >> $GITHUB_OUTPUT
-            echo "image_tag_prefix=prd" >> $GITHUB_OUTPUT
-            
-          else
-            # Homologação
-            echo "cluster_name=goshortener-hml" >> $GITHUB_OUTPUT
-            echo "namespace=goshortener-hml" >> $GITHUB_OUTPUT
-            echo "replicas=2" >> $GITHUB_OUTPUT
-            echo "image_tag_prefix=hml" >> $GITHUB_OUTPUT
+          # Validar branch main
+          if [ "$BRANCH" != "main" ]; then
+            echo "❌ Este workflow só aceita branch 'main'"
+            echo "Branch fornecida: $BRANCH"
+            exit 1
           fi
+          echo "✅ Branch validada: main"
           
-          # SSH Configuration (mesma para ambos ambientes)
-          echo "ssh_host=${{ secrets.SSH_HOST }}" >> $GITHUB_OUTPUT
-          echo "ssh_port=${{ secrets.SSH_PORT || '22' }}" >> $GITHUB_OUTPUT
+          # Validar confirmação obrigatória
+          if [ "${{ github.event.inputs.confirmation }}" != "DEPLOY-TO-PRODUCTION" ]; then
+            echo "❌ Deploy em PRODUÇÃO requer confirmação!"
+            echo "Digite exatamente: DEPLOY-TO-PRODUCTION"
+            exit 1
+          fi
+          echo "✅ Confirmação de produção validada"
+          
+          echo ""
+          echo "⚠️  DEPLOY EM PRODUÇÃO AUTORIZADO"
+          echo "   Cluster: ${{ env.CLUSTER_NAME }}"
+          echo "   Namespace: ${{ env.NAMESPACE }}"
+          echo "   Replicas: ${{ env.REPLICAS }}"
 
   build:
-    needs: setup
+    needs: validate
     runs-on: ubuntu-latest
     
     steps:
@@ -92,17 +70,15 @@ jobs:
       
       - name: Build Docker Image
         run: |
-          TAG_PREFIX="${{ needs.setup.outputs.image_tag_prefix }}"
-          
-          echo "🐳 Construindo imagem..."
+          echo "🐳 Construindo imagem de PRODUÇÃO..."
           
           docker build \
             --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
             --build-arg VCS_REF=${{ github.sha }} \
             --build-arg VERSION=${{ github.event.inputs.branch }} \
-            --build-arg ENVIRONMENT=${{ github.event.inputs.environment }} \
-            -t ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} \
-            -t ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-latest \
+            --build-arg ENVIRONMENT=production \
+            -t ${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
+            -t ${{ env.IMAGE_NAME }}:prd-latest \
             --load \
             .
           
@@ -110,10 +86,8 @@ jobs:
       
       - name: Save Docker Image
         run: |
-          TAG_PREFIX="${{ needs.setup.outputs.image_tag_prefix }}"
-          
           echo "💾 Salvando imagem para transferência..."
-          docker save ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} | gzip > image.tar.gz
+          docker save ${{ env.IMAGE_NAME }}:prd-${{ github.sha }} | gzip > image.tar.gz
           
           echo "📊 Tamanho da imagem:"
           ls -lh image.tar.gz
@@ -126,9 +100,9 @@ jobs:
           retention-days: 1
 
   deploy:
-    needs: [setup, build]
+    needs: [validate, build]
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+    environment: production
     
     steps:
       - name: Checkout code
@@ -148,77 +122,73 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           
           # Add host to known_hosts
-          ssh-keyscan -p ${{ needs.setup.outputs.ssh_port }} ${{ needs.setup.outputs.ssh_host }} >> ~/.ssh/known_hosts
+          ssh-keyscan -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
           
           echo "✅ SSH configurado!"
       
       - name: Transfer Docker Image
         run: |
-          echo "📤 Transferindo imagem para servidor..."
+          echo "📤 Transferindo imagem para servidor PRODUÇÃO..."
           
           scp -i ~/.ssh/deploy_key \
-            -P ${{ needs.setup.outputs.ssh_port }} \
+            -P ${{ secrets.SSH_PORT || '22' }} \
             image.tar.gz \
-            ${{ secrets.SSH_USER }}@${{ needs.setup.outputs.ssh_host }}:/tmp/goshortener-image.tar.gz
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/goshortener-prd-image.tar.gz
           
           echo "✅ Imagem transferida!"
       
-      - name: Deploy to Server
+      - name: Deploy to Production
         run: |
-          CLUSTER_NAME="${{ needs.setup.outputs.cluster_name }}"
-          NAMESPACE="${{ needs.setup.outputs.namespace }}"
-          TAG_PREFIX="${{ needs.setup.outputs.image_tag_prefix }}"
-          REPLICAS="${{ needs.setup.outputs.replicas }}"
-          
-          echo "🚀 Executando deploy no servidor..."
+          echo "🚀 Executando deploy em PRODUÇÃO..."
+          echo "⚠️  ATENÇÃO: Deploy em ambiente de PRODUÇÃO!"
           
           ssh -i ~/.ssh/deploy_key \
-            -p ${{ needs.setup.outputs.ssh_port }} \
-            ${{ secrets.SSH_USER }}@${{ needs.setup.outputs.ssh_host }} \
-            bash -s <<EOF
+            -p ${{ secrets.SSH_PORT || '22' }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            bash -s <<'EOF'
           
           set -e
           
           echo "📦 Carregando imagem Docker..."
-          docker load < /tmp/goshortener-image.tar.gz
+          docker load < /tmp/goshortener-prd-image.tar.gz
           
           echo "🏷️  Tagueando imagem para registry local..."
-          docker tag ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }}
-          docker tag ${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-latest
+          docker tag ${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }}
+          docker tag ${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-latest
           
           echo "📤 Enviando para registry local..."
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }}
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-latest
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-latest
           
-          echo "☸️  Configurando kubectl..."
-          kubectl config use-context kind-${CLUSTER_NAME}
+          echo "☸️  Configurando kubectl para PRODUÇÃO..."
+          kubectl config use-context kind-${{ env.CLUSTER_NAME }}
           
           echo "📝 Criando namespace se necessário..."
-          kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
           
-          echo "🚀 Aplicando deployment..."
+          echo "🚀 Aplicando deployment em PRODUÇÃO..."
           
           # Verificar se deployment existe
-          if kubectl get deployment goshortener -n ${NAMESPACE} &>/dev/null; then
-            echo "♻️  Atualizando deployment existente..."
+          if kubectl get deployment goshortener -n ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "♻️  Atualizando deployment existente em PRODUÇÃO..."
             kubectl set image deployment/goshortener \
-              goshortener=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} \
-              -n ${NAMESPACE}
+              goshortener=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
+              -n ${{ env.NAMESPACE }}
           else
-            echo "🆕 Criando novo deployment..."
+            echo "🆕 Criando novo deployment em PRODUÇÃO..."
             kubectl create deployment goshortener \
-              --image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} \
-              --replicas=${REPLICAS} \
-              -n ${NAMESPACE}
+              --image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
+              --replicas=${{ env.REPLICAS }} \
+              -n ${{ env.NAMESPACE }}
             
             # Adicionar labels
             kubectl label deployment goshortener \
               app=goshortener \
               version=v1 \
-              environment=${{ github.event.inputs.environment }} \
-              -n ${NAMESPACE}
+              environment=production \
+              -n ${{ env.NAMESPACE }}
           fi
           
           echo "🔌 Configurando service..."
@@ -226,43 +196,41 @@ jobs:
             --port=80 \
             --target-port=8080 \
             --type=ClusterIP \
-            -n ${NAMESPACE} \
+            -n ${{ env.NAMESPACE }} \
             --dry-run=client -o yaml | kubectl apply -f -
           
           echo "⏳ Aguardando rollout..."
-          kubectl rollout status deployment/goshortener -n ${NAMESPACE} --timeout=300s
+          kubectl rollout status deployment/goshortener -n ${{ env.NAMESPACE }} --timeout=600s
           
-          echo "✅ Deploy concluído!"
+          echo "✅ Deploy PRODUÇÃO concluído!"
           
           echo "🧹 Limpando arquivo temporário..."
-          rm -f /tmp/goshortener-image.tar.gz
+          rm -f /tmp/goshortener-prd-image.tar.gz
           
           EOF
       
-      - name: Verify Deployment
+      - name: Verify Production Deployment
         run: |
-          NAMESPACE="${{ needs.setup.outputs.namespace }}"
-          
-          echo "🔍 Verificando deployment no servidor..."
+          echo "🔍 Verificando deployment em PRODUÇÃO..."
           
           ssh -i ~/.ssh/deploy_key \
-            -p ${{ needs.setup.outputs.ssh_port }} \
-            ${{ secrets.SSH_USER }}@${{ needs.setup.outputs.ssh_host }} \
-            bash -s <<EOF
+            -p ${{ secrets.SSH_PORT || '22' }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            bash -s <<'EOF'
           
-          kubectl config use-context kind-${{ needs.setup.outputs.cluster_name }}
+          kubectl config use-context kind-${{ env.CLUSTER_NAME }}
           
           echo ""
-          echo "📊 Status dos Pods:"
-          kubectl get pods -n ${NAMESPACE} -l app=goshortener
+          echo "📊 Status dos Pods PRODUÇÃO:"
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=goshortener -o wide
           
           echo ""
           echo "🔌 Status do Service:"
-          kubectl get svc -n ${NAMESPACE} goshortener
+          kubectl get svc -n ${{ env.NAMESPACE }} goshortener
           
           echo ""
           echo "📋 Deployment Info:"
-          kubectl get deployment goshortener -n ${NAMESPACE}
+          kubectl describe deployment goshortener -n ${{ env.NAMESPACE }} | grep -A 5 "^Replicas\|^Image"
           
           EOF
       
@@ -271,19 +239,21 @@ jobs:
         run: |
           rm -f ~/.ssh/deploy_key
       
-      - name: Deployment Summary
+      - name: Production Deployment Summary
         run: |
           echo "╔══════════════════════════════════════════════════════════════╗"
-          echo "║       DEPLOYMENT SUMMARY - SERVER                             ║"
+          echo "║       PRODUCTION DEPLOYMENT - SUCCESS                         ║"
           echo "╚══════════════════════════════════════════════════════════════╝"
           echo ""
-          echo "🌐 Ambiente:       ${{ github.event.inputs.environment }}"
-          echo "📦 Cluster:        ${{ needs.setup.outputs.cluster_name }}"
-          echo "🏷️  Namespace:      ${{ needs.setup.outputs.namespace }}"
+          echo "🌐 Ambiente:       PRODUCTION"
+          echo "📦 Cluster:        ${{ env.CLUSTER_NAME }}"
+          echo "🏷️  Namespace:      ${{ env.NAMESPACE }}"
+          echo "🔢 Replicas:       ${{ env.REPLICAS }}"
           echo "🌿 Branch:         ${{ github.event.inputs.branch }}"
           echo "🔖 Commit:         ${{ github.sha }}"
           echo "👤 Deployed by:    ${{ github.actor }}"
           echo "⏰ Deploy time:    $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           echo "🖥️  Server:         ${{ secrets.SSH_HOST }}"
           echo ""
-          echo "✅ Aplicação deployada no seu servidor!"
+          echo "✅ Aplicação deployada em PRODUÇÃO!"
+          echo "⚠️  Monitorar logs e métricas!"

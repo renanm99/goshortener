@@ -242,17 +242,67 @@ jobs:
               -n ${{ env.NAMESPACE }}
           else
             echo "🆕 Criando novo deployment em PRODUÇÃO..."
-            kubectl create deployment goshortener \
-              --image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
-              --replicas=${{ env.REPLICAS }} \
-              -n ${{ env.NAMESPACE }}
             
-            # Adicionar labels
-            kubectl label deployment goshortener \
-              app=goshortener \
-              version=v1 \
-              environment=production \
-              -n ${{ env.NAMESPACE }}
+            # Criar deployment via YAML para ter mais controle
+            cat <<YAML | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: goshortener
+  namespace: ${{ env.NAMESPACE }}
+  labels:
+    app: goshortener
+    version: v1
+    environment: production
+spec:
+  replicas: ${{ env.REPLICAS }}
+  selector:
+    matchLabels:
+      app: goshortener
+  template:
+    metadata:
+      labels:
+        app: goshortener
+        version: v1
+        environment: production
+    spec:
+      containers:
+      - name: goshortener
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: PORT
+          value: "8080"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "200m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+YAML
           fi
           
           echo "🔌 Configurando service..."
@@ -263,8 +313,17 @@ jobs:
             -n ${{ env.NAMESPACE }} \
             --dry-run=client -o yaml | kubectl apply -f -
           
-          echo "⏳ Aguardando rollout..."
-          kubectl rollout status deployment/goshortener -n ${{ env.NAMESPACE }} --timeout=600s
+          echo "⏳ Aguardando rollout em PRODUÇÃO..."
+          echo "🔍 Verificando status dos pods..."
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=goshortener
+          
+          # Aguardar com timeout maior
+          if ! kubectl rollout status deployment/goshortener -n ${{ env.NAMESPACE }} --timeout=600s; then
+            echo "❌ Rollout timeout! Verificando logs dos pods..."
+            kubectl get pods -n ${{ env.NAMESPACE }} -l app=goshortener -o wide
+            kubectl describe pods -n ${{ env.NAMESPACE }} -l app=goshortener
+            exit 1
+          fi
           
           echo "✅ Deploy PRODUÇÃO concluído!"
           

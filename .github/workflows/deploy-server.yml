@@ -226,11 +226,6 @@ jobs:
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }}
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-latest
           
-          echo "🔄 Tagueando para acesso do Kind (registry:5000)..."
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
-            registry:5000/${{ env.IMAGE_NAME }}:prd-${{ github.sha }}
-          docker push registry:5000/${{ env.IMAGE_NAME }}:prd-${{ github.sha }}
-          
           echo "☸️  Configurando kubectl para PRODUÇÃO..."
           kubectl config use-context kind-${{ env.CLUSTER_NAME }}
           
@@ -243,12 +238,12 @@ jobs:
           if kubectl get deployment goshortener -n ${{ env.NAMESPACE }} &>/dev/null; then
             echo "♻️  Atualizando deployment existente em PRODUÇÃO..."
             kubectl set image deployment/goshortener \
-              goshortener=registry:5000/${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
+              goshortener=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
               -n ${{ env.NAMESPACE }}
           else
             echo "🆕 Criando novo deployment em PRODUÇÃO..."
             kubectl create deployment goshortener \
-              --image=registry:5000/${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
+              --image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
               --replicas=${{ env.REPLICAS }} \
               -n ${{ env.NAMESPACE }}
             
@@ -261,7 +256,7 @@ jobs:
               -n ${{ env.NAMESPACE }}
             
             kubectl set image deployment/goshortener \
-              goshortener=registry:5000/${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
+              goshortener=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prd-${{ github.sha }} \
               -n ${{ env.NAMESPACE }}
             
             kubectl set resources deployment/goshortener \

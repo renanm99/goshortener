@@ -3,6 +3,12 @@ name: Deploy to Homologation
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - homologation
       branch:
         description: 'Branch to deploy'
         required: true

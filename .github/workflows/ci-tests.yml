@@ -15,16 +15,6 @@ on:
         required: true
         type: string
         default: 'develop'
-      run_tests:
-        description: 'Run tests before deploy'
-        required: false
-        type: boolean
-        default: true
-      force_deploy:
-        description: 'Force deployment (skip test failures - HML only)'
-        required: false
-        type: boolean
-        default: false
   
   push:
     branches:

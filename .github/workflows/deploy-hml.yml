@@ -3,12 +3,6 @@ name: Deploy to Homologation
 on:
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Target environment'
-        required: true
-        type: choice
-        options:
-          - homologation
       branch:
         description: 'Branch to deploy'
         required: true
@@ -210,67 +204,33 @@ jobs:
               -n ${{ env.NAMESPACE }}
           else
             echo "🆕 Criando novo deployment..."
+            kubectl create deployment goshortener \
+              --image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:hml-${{ github.sha }} \
+              --replicas=${{ env.REPLICAS }} \
+              -n ${{ env.NAMESPACE }}
             
-            # Criar deployment via YAML para ter mais controle
-            cat <<YAML | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: goshortener
-  namespace: ${{ env.NAMESPACE }}
-  labels:
-    app: goshortener
-    version: v1
-    environment: homologation
-spec:
-  replicas: ${{ env.REPLICAS }}
-  selector:
-    matchLabels:
-      app: goshortener
-  template:
-    metadata:
-      labels:
-        app: goshortener
-        version: v1
-        environment: homologation
-    spec:
-      containers:
-      - name: goshortener
-        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:hml-${{ github.sha }}
-        imagePullPolicy: Always
-        ports:
-        - containerPort: 8080
-          name: http
-          protocol: TCP
-        env:
-        - name: ENVIRONMENT
-          value: "homologation"
-        - name: PORT
-          value: "8080"
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8080
-          initialDelaySeconds: 10
-          periodSeconds: 10
-          timeoutSeconds: 5
-          failureThreshold: 3
-        readinessProbe:
-          httpGet:
-            path: /ready
-            port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 5
-          timeoutSeconds: 3
-          failureThreshold: 3
-        resources:
-          requests:
-            memory: "64Mi"
-            cpu: "100m"
-          limits:
-            memory: "128Mi"
-            cpu: "200m"
-YAML
+            kubectl label deployment goshortener \
+              app=goshortener version=v1 environment=homologation \
+              -n ${{ env.NAMESPACE }}
+            
+            kubectl set env deployment/goshortener \
+              ENVIRONMENT=homologation PORT=8080 \
+              -n ${{ env.NAMESPACE }}
+            
+            kubectl set image deployment/goshortener \
+              goshortener=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:hml-${{ github.sha }} \
+              -n ${{ env.NAMESPACE }}
+            
+            kubectl set resources deployment/goshortener \
+              --requests=memory=64Mi,cpu=100m \
+              --limits=memory=128Mi,cpu=200m \
+              -n ${{ env.NAMESPACE }}
+            
+            kubectl patch deployment goshortener -n ${{ env.NAMESPACE }} --type=json -p='[
+              {"op":"add","path":"/spec/template/spec/containers/0/livenessProbe","value":{"httpGet":{"path":"/health","port":8080},"initialDelaySeconds":10,"periodSeconds":10,"timeoutSeconds":5,"failureThreshold":3}},
+              {"op":"add","path":"/spec/template/spec/containers/0/readinessProbe","value":{"httpGet":{"path":"/ready","port":8080},"initialDelaySeconds":5,"periodSeconds":5,"timeoutSeconds":3,"failureThreshold":3}},
+              {"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"}
+            ]'
           fi
           
           echo "🔌 Configurando service..."
@@ -304,10 +264,7 @@ YAML
         run: |
           echo "🔍 Verificando deployment em HOMOLOGAÇÃO..."
           
-          ssh -i ~/.ssh/deploy_key \
-            -p ${{ secrets.SSH_PORT || '22' }} \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            bash -s <<'EOF'
+          ssh cf-ssh bash -s <<'EOF'
           
           kubectl config use-context kind-${{ env.CLUSTER_NAME }}
           

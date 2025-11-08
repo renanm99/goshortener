@@ -1,0 +1,236 @@
+name: Deploy to Homologation
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy'
+        required: true
+        type: string
+        default: 'develop'
+  
+  push:
+    branches:
+      - develop
+      - 'feature/**'
+      - 'bugfix/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+
+env:
+  REGISTRY: localhost:5000
+  IMAGE_NAME: goshortener
+  ENVIRONMENT: homologation
+  CLUSTER_NAME: goshortener-hml
+  NAMESPACE: goshortener-hml
+  REPLICAS: 2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref_name }}
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build Docker Image
+        run: |
+          BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
+          
+          echo "🐳 Construindo imagem para HOMOLOGAÇÃO..."
+          echo "📦 Branch: $BRANCH"
+          
+          docker build \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg VERSION=$BRANCH \
+            --build-arg ENVIRONMENT=homologation \
+            -t ${{ env.IMAGE_NAME }}:hml-${{ github.sha }} \
+            -t ${{ env.IMAGE_NAME }}:hml-latest \
+            --load \
+            .
+          
+          echo "✅ Imagem construída!"
+      
+      - name: Save Docker Image
+        run: |
+          echo "💾 Salvando imagem para transferência..."
+          docker save ${{ env.IMAGE_NAME }}:hml-${{ github.sha }} | gzip > image.tar.gz
+          
+          echo "📊 Tamanho da imagem:"
+          ls -lh image.tar.gz
+      
+      - name: Upload Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-hml
+          path: image.tar.gz
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: homologation
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref_name }}
+      
+      - name: Download Image Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-hml
+      
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          
+          # Add host to known_hosts
+          ssh-keyscan -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          
+          echo "✅ SSH configurado!"
+      
+      - name: Transfer Docker Image
+        run: |
+          echo "📤 Transferindo imagem para servidor HML..."
+          
+          scp -i ~/.ssh/deploy_key \
+            -P ${{ secrets.SSH_PORT || '22' }} \
+            image.tar.gz \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/goshortener-hml-image.tar.gz
+          
+          echo "✅ Imagem transferida!"
+      
+      - name: Deploy to Homologation
+        run: |
+          echo "🚀 Executando deploy em HOMOLOGAÇÃO..."
+          
+          ssh -i ~/.ssh/deploy_key \
+            -p ${{ secrets.SSH_PORT || '22' }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            bash -s <<'EOF'
+          
+          set -e
+          
+          echo "📦 Carregando imagem Docker..."
+          docker load < /tmp/goshortener-hml-image.tar.gz
+          
+          echo "🏷️  Tagueando imagem para registry local..."
+          docker tag ${{ env.IMAGE_NAME }}:hml-${{ github.sha }} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:hml-${{ github.sha }}
+          docker tag ${{ env.IMAGE_NAME }}:hml-${{ github.sha }} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:hml-latest
+          
+          echo "📤 Enviando para registry local..."
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:hml-${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:hml-latest
+          
+          echo "☸️  Configurando kubectl para HML..."
+          kubectl config use-context kind-${{ env.CLUSTER_NAME }}
+          
+          echo "📝 Criando namespace se necessário..."
+          kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          
+          echo "🚀 Aplicando deployment..."
+          
+          # Verificar se deployment existe
+          if kubectl get deployment goshortener -n ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "♻️  Atualizando deployment existente..."
+            kubectl set image deployment/goshortener \
+              goshortener=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:hml-${{ github.sha }} \
+              -n ${{ env.NAMESPACE }}
+          else
+            echo "🆕 Criando novo deployment..."
+            kubectl create deployment goshortener \
+              --image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:hml-${{ github.sha }} \
+              --replicas=${{ env.REPLICAS }} \
+              -n ${{ env.NAMESPACE }}
+            
+            # Adicionar labels
+            kubectl label deployment goshortener \
+              app=goshortener \
+              version=v1 \
+              environment=homologation \
+              -n ${{ env.NAMESPACE }}
+          fi
+          
+          echo "🔌 Configurando service..."
+          kubectl expose deployment goshortener \
+            --port=80 \
+            --target-port=8080 \
+            --type=ClusterIP \
+            -n ${{ env.NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          echo "⏳ Aguardando rollout..."
+          kubectl rollout status deployment/goshortener -n ${{ env.NAMESPACE }} --timeout=300s
+          
+          echo "✅ Deploy HML concluído!"
+          
+          echo "🧹 Limpando arquivo temporário..."
+          rm -f /tmp/goshortener-hml-image.tar.gz
+          
+          EOF
+      
+      - name: Verify Deployment
+        run: |
+          echo "🔍 Verificando deployment em HOMOLOGAÇÃO..."
+          
+          ssh -i ~/.ssh/deploy_key \
+            -p ${{ secrets.SSH_PORT || '22' }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            bash -s <<'EOF'
+          
+          kubectl config use-context kind-${{ env.CLUSTER_NAME }}
+          
+          echo ""
+          echo "📊 Status dos Pods:"
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=goshortener -o wide
+          
+          echo ""
+          echo "🔌 Status do Service:"
+          kubectl get svc -n ${{ env.NAMESPACE }} goshortener
+          
+          echo ""
+          echo "📋 Deployment Info:"
+          kubectl describe deployment goshortener -n ${{ env.NAMESPACE }} | grep -A 5 "^Replicas\|^Image"
+          
+          EOF
+      
+      - name: Cleanup SSH
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+      
+      - name: Deployment Summary
+        run: |
+          BRANCH="${{ github.event.inputs.branch || github.ref_name }}"
+          TRIGGER="${{ github.event_name }}"
+          
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║       DEPLOY HOMOLOGATION - SUCCESS                           ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "🌐 Ambiente:       HOMOLOGAÇÃO"
+          echo "📦 Cluster:        ${{ env.CLUSTER_NAME }}"
+          echo "🏷️  Namespace:      ${{ env.NAMESPACE }}"
+          echo "🌿 Branch:         $BRANCH"
+          echo "🔖 Commit:         ${{ github.sha }}"
+          echo "👤 Deployed by:    ${{ github.actor }}"
+          echo "🔄 Trigger:        $TRIGGER"
+          echo "⏰ Deploy time:    $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "🖥️  Server:         ${{ secrets.SSH_HOST }}"
+          echo "🔢 Replicas:       ${{ env.REPLICAS }}"
+          echo ""
+          echo "✅ Aplicação deployada em HOMOLOGAÇÃO!"

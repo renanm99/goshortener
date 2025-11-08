@@ -1,0 +1,317 @@
+name: Deploy Application (Kind)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - homologation
+          - production
+      branch:
+        description: 'Branch to deploy'
+        required: true
+        type: string
+        default: 'develop'
+      run_tests:
+        description: 'Run tests before deploy'
+        required: false
+        type: boolean
+        default: true
+      force_deploy:
+        description: 'Force deployment (skip test failures - HML only)'
+        required: false
+        type: boolean
+        default: false
+  
+  push:
+    branches:
+      - develop
+      - 'feature/**'
+      - 'bugfix/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+
+env:
+  REGISTRY: localhost:5000
+  IMAGE_NAME: goshortener
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      cluster_name: ${{ steps.set-env.outputs.cluster_name }}
+      namespace: ${{ steps.set-env.outputs.namespace }}
+      replicas: ${{ steps.set-env.outputs.replicas }}
+      image_tag_prefix: ${{ steps.set-env.outputs.image_tag_prefix }}
+      log_level: ${{ steps.set-env.outputs.log_level }}
+      memory_request: ${{ steps.set-env.outputs.memory_request }}
+      memory_limit: ${{ steps.set-env.outputs.memory_limit }}
+      cpu_request: ${{ steps.set-env.outputs.cpu_request }}
+      cpu_limit: ${{ steps.set-env.outputs.cpu_limit }}
+      environment: ${{ steps.set-env.outputs.environment }}
+      deploy_branch: ${{ steps.set-env.outputs.deploy_branch }}
+    
+    steps:
+      - name: Determine Environment and Branch
+        id: set-env
+        run: |
+          # Se foi push automático
+          if [ "${{ github.event_name }}" == "push" ]; then
+            ENV="homologation"
+            BRANCH="${{ github.ref_name }}"
+            echo "🔄 Deploy automático via push"
+          else
+            # Se foi manual
+            ENV="${{ github.event.inputs.environment }}"
+            BRANCH="${{ github.event.inputs.branch }}"
+            echo "👤 Deploy manual"
+          fi
+          
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "deploy_branch=$BRANCH" >> $GITHUB_OUTPUT
+          
+          echo "🔧 Configurando para: $ENV (branch: $BRANCH)"
+          
+          # Validações específicas por ambiente
+          if [ "$ENV" == "production" ]; then
+            # Produção: branch deve ser main ou hotfix
+            if [[ "$BRANCH" != "main" ]] && [[ "$BRANCH" != hotfix/* ]]; then
+              echo "❌ Produção só aceita branch 'main' ou 'hotfix/*'"
+              echo "Branch fornecida: $BRANCH"
+              exit 1
+            fi
+            
+            echo "cluster_name=goshortener-prd" >> $GITHUB_OUTPUT
+            echo "namespace=goshortener-prd" >> $GITHUB_OUTPUT
+            echo "replicas=3" >> $GITHUB_OUTPUT
+            echo "image_tag_prefix=prd" >> $GITHUB_OUTPUT
+            echo "log_level=info" >> $GITHUB_OUTPUT
+            echo "memory_request=256Mi" >> $GITHUB_OUTPUT
+            echo "memory_limit=512Mi" >> $GITHUB_OUTPUT
+            echo "cpu_request=250m" >> $GITHUB_OUTPUT
+            echo "cpu_limit=500m" >> $GITHUB_OUTPUT
+            
+            echo "✅ Configuração de PRODUÇÃO aplicada"
+            
+          else
+            # Homologação: aceita qualquer branch
+            echo "cluster_name=goshortener-hml" >> $GITHUB_OUTPUT
+            echo "namespace=goshortener-hml" >> $GITHUB_OUTPUT
+            echo "replicas=2" >> $GITHUB_OUTPUT
+            echo "image_tag_prefix=hml" >> $GITHUB_OUTPUT
+            echo "log_level=debug" >> $GITHUB_OUTPUT
+            echo "memory_request=128Mi" >> $GITHUB_OUTPUT
+            echo "memory_limit=256Mi" >> $GITHUB_OUTPUT
+            echo "cpu_request=100m" >> $GITHUB_OUTPUT
+            echo "cpu_limit=300m" >> $GITHUB_OUTPUT
+            
+            echo "✅ Configuração de HOMOLOGAÇÃO aplicada"
+          fi
+          
+          echo ""
+          echo "📋 Resumo:"
+          echo "  Environment: $ENV"
+          echo "  Branch: $BRANCH"
+          echo "  Trigger: ${{ github.event_name }}"
+
+  test:
+    needs: setup
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.run_tests != 'false' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.deploy_branch }}
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ needs.setup.outputs.environment }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ needs.setup.outputs.environment }}-
+            ${{ runner.os }}-go-
+      
+      - name: Run tests
+        run: |
+          echo "🧪 Executando testes para ${{ needs.setup.outputs.environment }}..."
+          go mod download
+          go test -v -cover -race ./...
+          go test -coverprofile=coverage.out ./...
+          go tool cover -html=coverage.out -o coverage.html
+          
+          # Gerar relatório de cobertura
+          coverage=$(go tool cover -func=coverage.out | grep total | awk '{print $3}')
+          echo "📊 Cobertura de testes: $coverage"
+          
+          # Critérios diferentes por ambiente
+          if [ "${{ needs.setup.outputs.environment }}" == "production" ]; then
+            if [ "${coverage%.*}" -lt 80 ]; then
+              echo "❌ Cobertura abaixo de 80% - Bloqueado em PRODUÇÃO!"
+              exit 1
+            else
+              echo "✅ Cobertura adequada para produção (>80%)"
+            fi
+          else
+            if [ "${coverage%.*}" -lt 80 ]; then
+              echo "⚠️ Cobertura abaixo de 80% - Deploy permitido em HML"
+            else
+              echo "✅ Cobertura adequada"
+            fi
+          fi
+      
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ needs.setup.outputs.environment }}
+          path: coverage.html
+
+  deploy:
+    needs: [setup, test]
+    runs-on: ubuntu-latest
+    if: ${{ always() && !failure() || (failure() && github.event.inputs.force_deploy == 'true' && needs.setup.outputs.environment == 'homologation') }}
+    environment: ${{ needs.setup.outputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.deploy_branch }}
+      
+      - name: Install Kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+      
+      - name: Create Kind Cluster
+        run: |
+          CLUSTER_NAME="${{ needs.setup.outputs.cluster_name }}"
+          
+          echo "🔧 Criando Kind cluster: $CLUSTER_NAME"
+          
+          cat <<EOF | kind create cluster --name ${CLUSTER_NAME} --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            extraPortMappings:
+            - containerPort: 80
+              hostPort: 8080
+              protocol: TCP
+          - role: worker
+          containerdConfigPatches:
+          - |-
+            [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5000"]
+              endpoint = ["http://registry:5000"]
+          EOF
+          
+          kubectl cluster-info --context kind-${CLUSTER_NAME}
+          echo "✅ Cluster criado!"
+      
+      - name: Setup Local Registry
+        run: |
+          # Criar registry local
+          docker run -d --restart=always -p 5000:5000 --name registry registry:2
+          
+          # Conectar registry ao network do kind
+          docker network connect kind registry
+          
+          echo "✅ Registry configurado em localhost:5000"
+      
+      - name: Build and Push Image
+        run: |
+          TAG_PREFIX="${{ needs.setup.outputs.image_tag_prefix }}"
+          ENV="${{ needs.setup.outputs.environment }}"
+          
+          echo "🐳 Construindo imagem para $ENV..."
+          
+          docker build \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg VERSION=${{ needs.setup.outputs.deploy_branch }} \
+            --build-arg ENVIRONMENT=$ENV \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-latest \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} \
+            .
+          
+          echo "📤 Enviando para registry..."
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-latest
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }}
+          
+          echo "✅ Imagem pronta: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }}"
+      
+      - name: Deploy to Kubernetes
+        run: |
+          CLUSTER_NAME="${{ needs.setup.outputs.cluster_name }}"
+          NAMESPACE="${{ needs.setup.outputs.namespace }}"
+          TAG_PREFIX="${{ needs.setup.outputs.image_tag_prefix }}"
+          
+          echo "🚀 Deploy para ${{ needs.setup.outputs.environment }}..."
+          
+          kubectl config use-context kind-${CLUSTER_NAME}
+          
+          # Criar namespace se não existir
+          kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy via kubectl
+          kubectl set image deployment/goshortener \
+            goshortener=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} \
+            -n $NAMESPACE || \
+          kubectl create deployment goshortener \
+            --image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_PREFIX}-${{ github.sha }} \
+            --replicas=${{ needs.setup.outputs.replicas }} \
+            -n $NAMESPACE
+          
+          # Expor serviço
+          kubectl expose deployment goshortener \
+            --port=80 \
+            --target-port=8080 \
+            --type=ClusterIP \
+            -n $NAMESPACE || echo "Service já existe"
+          
+          # Aguardar rollout
+          kubectl rollout status deployment/goshortener -n $NAMESPACE --timeout=300s
+          
+          echo "✅ Deploy concluído!"
+      
+      - name: Verify Deployment
+        run: |
+          NAMESPACE="${{ needs.setup.outputs.namespace }}"
+          
+          echo "🔍 Verificando deployment..."
+          kubectl get pods,svc -n $NAMESPACE
+          kubectl wait --for=condition=ready pod -l app=goshortener -n $NAMESPACE --timeout=120s || true
+      
+      - name: Deployment Summary
+        run: |
+          CLUSTER_NAME="${{ needs.setup.outputs.cluster_name }}"
+          NAMESPACE="${{ needs.setup.outputs.namespace }}"
+          
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║       DEPLOYMENT SUMMARY                                      ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "🌐 Ambiente:       ${{ needs.setup.outputs.environment }}"
+          echo "📦 Cluster:        $CLUSTER_NAME"
+          echo "🏷️  Namespace:      $NAMESPACE"
+          echo "🌿 Branch:         ${{ needs.setup.outputs.deploy_branch }}"
+          echo "🔖 Commit:         ${{ github.sha }}"
+          echo "👤 Deployed by:    ${{ github.actor }}"
+          echo "⏰ Deploy time:    $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+          echo "📊 Recursos:"
+          kubectl get pods,svc,deploy -n $NAMESPACE

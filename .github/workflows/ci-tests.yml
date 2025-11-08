@@ -1,4 +1,4 @@
-name: Deploy Application (Kind)
+name: CI Tests (Kind)
 
 on:
   workflow_dispatch:

@@ -153,6 +153,10 @@ jobs:
             ProxyCommand cloudflared access ssh --hostname %h
             IdentityFile ~/.ssh/deploy_key
             StrictHostKeyChecking no
+            ServerAliveInterval 30
+            ServerAliveCountMax 10
+            TCPKeepAlive yes
+            ConnectTimeout 60
           EOF
           
           chmod 600 ~/.ssh/config

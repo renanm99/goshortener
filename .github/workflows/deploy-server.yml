@@ -181,14 +181,16 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           
-          # Configure SSH - Direct connection (não usa Cloudflare Tunnel proxy)
+          # Configure SSH with Cloudflare Tunnel ProxyCommand (sem autenticação adicional)
           cat >> ~/.ssh/config <<EOF
           Host cf-ssh
             Hostname ${{ secrets.SSH_HOST }}
             User ${{ secrets.SSH_USER }}
             PubkeyAuthentication yes
+            ProxyCommand cloudflared access ssh --hostname %h
             IdentityFile ~/.ssh/deploy_key
             StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
             ServerAliveInterval 30
             ServerAliveCountMax 10
             TCPKeepAlive yes

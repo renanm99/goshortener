@@ -144,13 +144,12 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           
-          # Configure SSH for Cloudflare Tunnel
+          # Configure SSH - Direct connection (não usa Cloudflare Tunnel proxy)
           cat >> ~/.ssh/config <<EOF
           Host cf-ssh
             Hostname ${{ secrets.SSH_HOST }}
             User ${{ secrets.SSH_USER }}
             PubkeyAuthentication yes
-            ProxyCommand cloudflared access ssh --hostname %h
             IdentityFile ~/.ssh/deploy_key
             StrictHostKeyChecking no
             ServerAliveInterval 30
@@ -161,7 +160,7 @@ jobs:
           
           chmod 600 ~/.ssh/config
           
-          echo "✅ SSH configurado para Cloudflare Tunnel!"
+          echo "✅ SSH configurado!"
       
       - name: Transfer Docker Image
         run: |
